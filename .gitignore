@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# env
+.env
+
+# sqlite/local data
+data/
+*.db
+
+# mac
+.DS_Store
+
+# logs
+*.log
