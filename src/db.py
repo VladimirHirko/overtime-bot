@@ -220,6 +220,62 @@ class DB:
         except Exception:
             pass
 
+    # ---------- RESET / WIPE ----------
+    def reset_all_data(self) -> None:
+        """
+        Deletes ALL rows from all business tables, but keeps schema intact.
+        Works for both Postgres (Railway) and SQLite (local).
+        """
+        if self.driver == "postgres":
+            self._reset_all_data_pg()
+        else:
+            self._reset_all_data_sqlite()
+
+    def _reset_all_data_pg(self) -> None:
+        """
+        Postgres: TRUNCATE + RESTART IDENTITY + CASCADE
+        """
+        # Важно: TRUNCATE не принимает плейсхолдеры, поэтому обычной строкой.
+        # Порядок не критичен из-за CASCADE, но держим логичный.
+        self.execute("""
+            TRUNCATE TABLE
+                audit_log,
+                operations,
+                users,
+                teams
+            RESTART IDENTITY CASCADE;
+        """)
+
+    def _reset_all_data_sqlite(self) -> None:
+        """
+        SQLite: DELETE FROM tables + reset autoincrement counters.
+        """
+        # В SQLite лучше отключить FK на время, иначе можно словить ограничения
+        try:
+            self.conn.execute("PRAGMA foreign_keys = OFF;")
+        except Exception:
+            pass
+
+        cur = self.conn.cursor()
+
+        # Порядок: сначала дочерние, потом родительские
+        for t in ("audit_log", "operations", "users", "teams"):
+            cur.execute(f"DELETE FROM {t};")
+
+        # Сброс автоинкремента (если есть AUTOINCREMENT)
+        try:
+            cur.execute("DELETE FROM sqlite_sequence;")
+        except Exception:
+            # sqlite_sequence может отсутствовать, если AUTOINCREMENT не использовался
+            pass
+
+        self.conn.commit()
+
+        try:
+            self.conn.execute("PRAGMA foreign_keys = ON;")
+        except Exception:
+            pass
+
     # ---------- Helpers (Users / Teams) ----------
 
     def get_user_by_tg(self, tg_id: int) -> dict | None:

@@ -27,6 +27,7 @@ from telegram.ext import (
 
 from src.config import load_settings
 from src.db import DB
+from src.handlers.admin_reset import build_admin_reset_conv
 
 
 # ---------- Conversation states ----------
@@ -102,6 +103,7 @@ def main_menu(role: str, is_super_admin: bool = False) -> ReplyKeyboardMarkup:
             [KeyboardButton("➕ Добавить пользователя"), KeyboardButton("👥 Пользователи")],
             [KeyboardButton("✏️ Изменить пользователя"), KeyboardButton("🗑️ Удалить пользователя")],
             [KeyboardButton("🏗️ Команды"), KeyboardButton("👤 Назначить бригадира")],
+            [KeyboardButton("🧨 Сброс БД")],
             [KeyboardButton("ℹ️ Помощь")],
         ]
         if is_super_admin:
@@ -2037,6 +2039,22 @@ def build_app() -> Application:
         persistent=False,
         allow_reentry=True,
     )
+
+    admin_reset_conv = build_admin_reset_conv(
+        db=db,
+        admin_tg_ids=set(settings.admin_tg_ids),
+        common_fallbacks=common_fallbacks,
+    )
+    app.add_handler(admin_reset_conv)
+
+    import logging
+    logger = logging.getLogger(__name__)
+
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception("Unhandled exception", exc_info=context.error)
+
+    app.add_error_handler(on_error)
+
     app.add_handler(foreman_adj_conv)
 
     app.add_handler(CallbackQueryHandler(foreman_stmt_pick, pattern=r"^stmt_pick:"))
