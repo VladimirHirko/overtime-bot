@@ -6,8 +6,8 @@ import json
 import sqlite3
 from typing import Any, Optional
 
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 
 
 Role = str  # "worker" | "foreman" | "director" | "admin"
@@ -30,7 +30,7 @@ class DB:
         self.driver = "postgres" if (database_url and database_url.startswith("postgres")) else "sqlite"
 
         if self.driver == "postgres":
-            self.conn = psycopg2.connect(database_url)
+            self.conn = psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
             self.conn.autocommit = True
         else:
             os.makedirs("data", exist_ok=True)
@@ -76,7 +76,7 @@ class DB:
     def execute(self, sql: str, params: tuple[Any, ...] = (), *, fetch: str | None = None) -> Any:
         sql = self._fmt(sql)
         if self.driver == "postgres":
-            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with self.conn.cursor() as cur:
                 cur.execute(sql, params)
                 if fetch == "one":
                     return cur.fetchone()
