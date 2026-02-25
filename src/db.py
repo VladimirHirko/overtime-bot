@@ -118,6 +118,7 @@ class DB:
             tg_id BIGINT NOT NULL UNIQUE,
             full_name TEXT NOT NULL,
             role TEXT NOT NULL,
+            view_mode TEXT NOT NULL DEFAULT 'worker',
             team_id INTEGER NULL REFERENCES teams(id) ON DELETE SET NULL,
             active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -160,6 +161,11 @@ class DB:
         # --- lightweight migrations ---
         self.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_welcome BOOLEAN NOT NULL DEFAULT FALSE;")
 
+        # --- view_mode (foreman/admin can switch to worker UI) ---
+        self.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS view_mode TEXT;")
+        self.execute("UPDATE users SET view_mode = role WHERE view_mode IS NULL;")
+        self.execute("ALTER TABLE users ALTER COLUMN view_mode SET DEFAULT 'worker';")
+
     def _ensure_schema_sqlite(self) -> None:
         self.execute("""
         CREATE TABLE IF NOT EXISTS teams (
@@ -175,6 +181,7 @@ class DB:
             tg_id INTEGER NOT NULL UNIQUE,
             full_name TEXT NOT NULL,
             role TEXT NOT NULL,
+            view_mode TEXT NOT NULL DEFAULT 'worker',
             team_id INTEGER NULL,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -215,8 +222,21 @@ class DB:
         self.execute("CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);")
         self.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);")
         # --- lightweight migrations ---
+        # seen_welcome
         try:
             self.execute("ALTER TABLE users ADD COLUMN seen_welcome INTEGER NOT NULL DEFAULT 0;")
+        except Exception:
+            pass
+
+        # view_mode
+        try:
+            self.execute("ALTER TABLE users ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'worker';")
+        except Exception:
+            pass
+
+        # normalize old rows
+        try:
+            self.execute("UPDATE users SET view_mode = role WHERE view_mode IS NULL OR view_mode='';")
         except Exception:
             pass
 
@@ -289,15 +309,15 @@ class DB:
     def create_user(self, tg_id: int, full_name: str, role: Role, team_id: int | None = None) -> dict:
         if self.driver == "postgres":
             row = self.execute(
-                "INSERT INTO users (tg_id, full_name, role, team_id) VALUES ({p},{p},{p},{p}) RETURNING *",
-                (tg_id, full_name, role, team_id),
+                "INSERT INTO users (tg_id, full_name, role, view_mode, team_id) VALUES ({p},{p},{p},{p},{p}) RETURNING *",
+                (tg_id, full_name, role, role, team_id),
                 fetch="one",
             )
             return row
         else:
             self.execute(
-                "INSERT INTO users (tg_id, full_name, role, team_id) VALUES ({p},{p},{p},{p})",
-                (tg_id, full_name, role, team_id),
+                "INSERT INTO users (tg_id, full_name, role, view_mode, team_id) VALUES ({p},{p},{p},{p},{p})",
+                (tg_id, full_name, role, role, team_id),
             )
             return self.get_user_by_tg(tg_id)  # type: ignore
 
@@ -310,7 +330,10 @@ class DB:
 
     def set_user_role_team(self, tg_id: int, role: Role, team_id: int | None) -> None:
         # обновляем пользователя
-        self.execute("UPDATE users SET role={p}, team_id={p} WHERE tg_id={p}", (role, team_id, tg_id))
+        self.execute(
+            "UPDATE users SET role={p}, team_id={p}, view_mode={p} WHERE tg_id={p}",
+            (role, team_id, role, tg_id),
+        )
 
         # ✅ Авто-привязка бригадира к команде:
         # когда пользователь становится foreman и у него есть team_id,
@@ -364,6 +387,9 @@ class DB:
         rows = self.execute("SELECT tg_id FROM users WHERE role='director' AND active=TRUE" if self.driver == "postgres"
                             else "SELECT tg_id FROM users WHERE role='director' AND active=1", fetch="all")
         return [int(r["tg_id"]) for r in rows]
+
+    def set_user_view_mode(self, tg_id: int, view_mode: str) -> None:
+        self.execute("UPDATE users SET view_mode={p} WHERE tg_id={p}", (view_mode, tg_id))
 
     # ---------- Operations / Balance ----------
 

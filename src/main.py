@@ -71,7 +71,11 @@ WELCOME_TEXT = (
 BTN_ADMIN_MODE = "🛠 Админ-режим"
 BTN_WORKER_MODE = "👷 Рабочий-режим"
 
-def main_menu(role: str, is_super_admin: bool = False) -> ReplyKeyboardMarkup:
+# --- Foreman mode switch (ONLY for role=foreman) ---
+BTN_FOREMAN_TO_WORKER = "👷 Режим работника"
+BTN_FOREMAN_TO_FOREMAN = "👷‍♂️ Режим бригадира"
+
+def main_menu(role: str, is_super_admin: bool = False, is_foreman: bool = False) -> ReplyKeyboardMarkup:
     if role == "worker":
         rows = [
             [KeyboardButton("➕ Добавить часы"), KeyboardButton("➖ Списать часы")],
@@ -81,6 +85,10 @@ def main_menu(role: str, is_super_admin: bool = False) -> ReplyKeyboardMarkup:
         if is_super_admin:
             rows.append([KeyboardButton(BTN_ADMIN_MODE)])
 
+        # ✅ Если реальная роль foreman и он сейчас в worker-режиме — даём кнопку вернуться
+        if is_foreman:
+            rows.append([KeyboardButton(BTN_FOREMAN_TO_FOREMAN)])
+
     elif role == "foreman":
         rows = [
             [KeyboardButton("⏳ Заявки на подтверждение"), KeyboardButton("👥 Команда (балансы)")],
@@ -89,6 +97,10 @@ def main_menu(role: str, is_super_admin: bool = False) -> ReplyKeyboardMarkup:
         ]
         if is_super_admin:
             rows.append([KeyboardButton(BTN_ADMIN_MODE)])
+
+        # ✅ Бригадир может уйти в режим работника
+        if is_foreman:
+            rows.append([KeyboardButton(BTN_FOREMAN_TO_WORKER)])
 
     elif role == "director":
         rows = [
@@ -171,6 +183,33 @@ def ensure_user_or_deny(update: Update, tg_id: int, full_name: str) -> dict | No
 
     return user
 
+def resolve_role_to_show(user: dict, tg_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """
+    1) Super-admin может переключать UI через context.user_data['ui_role'] (как сейчас).
+    2) Foreman переключает режим через users.view_mode в БД.
+    3) Worker/Director по умолчанию показываются как их роль.
+    """
+    db_role = user["role"]
+    is_super_admin = tg_id in settings.admin_tg_ids
+
+    # 1) super-admin ui override (только для tg_id из списка)
+    ui_role = context.user_data.get("ui_role")
+    if ui_role not in ("worker", "foreman", "director", "admin"):
+        ui_role = None
+
+    if is_super_admin and ui_role:
+        return ui_role
+
+    # 2) foreman mode from DB
+    if db_role == "foreman":
+        vm = user.get("view_mode")
+        if vm in ("worker", "foreman"):
+            return vm
+        return "foreman"
+
+    # 3) default
+    return db_role
+
 async def send_to_directors(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     director_ids = db.list_director_tg_ids()
     if not director_ids:
@@ -204,12 +243,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_super_admin = tg_id in settings.admin_tg_ids
     db_role = user["role"]
 
-    ui_role = context.user_data.get("ui_role")
-    if ui_role not in ("worker", "foreman", "director", "admin"):
-        ui_role = None
+    role_to_show = resolve_role_to_show(user, tg_id, context)
 
-    role_to_show = ui_role or db_role
-
+    # защита: если кто-то НЕ супер-админ, но в ui_role оказался admin — откатываем
     if role_to_show == "admin" and not is_super_admin:
         role_to_show = db_role
         context.user_data["ui_role"] = db_role
@@ -224,7 +260,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🧩 Режим: {ROLE_TITLES.get(role_to_show, role_to_show)}\n"
         f"👤 {user['full_name']}\n\n"
         "Выберите действие кнопками ниже.",
-        reply_markup=main_menu(role_to_show, is_super_admin=is_super_admin),
+        reply_markup=main_menu(
+            role_to_show,
+            is_super_admin=is_super_admin,
+            is_foreman=(db_role == "foreman"),
+        ),
     )
 
 async def start_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -250,12 +290,8 @@ async def help_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     is_super_admin = tg.id in settings.admin_tg_ids
     db_role = user["role"]
+    role_to_show = resolve_role_to_show(user, tg.id, context)
 
-    ui_role = context.user_data.get("ui_role")
-    if ui_role not in ("worker", "foreman", "director", "admin"):
-        ui_role = None
-
-    role_to_show = ui_role or db_role
     if role_to_show == "admin" and not is_super_admin:
         role_to_show = db_role
         context.user_data["ui_role"] = db_role
@@ -294,7 +330,7 @@ async def help_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         text,
-        reply_markup=main_menu(role_to_show, is_super_admin=is_super_admin),
+        reply_markup=main_menu(role_to_show, is_super_admin=is_super_admin, is_foreman=(db_role == "foreman")),
     )
 
 # ---------- Worker: create operation (credit/debit) ----------
@@ -380,12 +416,21 @@ async def op_comment_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         foreman_tg = None
 
+    # ✅ правильный режим меню (worker/foreman) + супер-админ переключатель остаётся как раньше
+    db_role = user["role"]
+    is_super_admin = tg.id in settings.admin_tg_ids
+    role_to_show = resolve_role_to_show(user, tg.id, context)
+
     sign = "➕" if op_type == "credit" else "➖"
     await update.message.reply_text(
         f"✅ Заявка отправлена бригадиру.\n"
         f"{sign} {hours} ч • {op_date}\n"
         f"Комментарий: {comment}",
-        reply_markup=main_menu(user["role"]),
+        reply_markup=main_menu(
+            role_to_show,
+            is_super_admin=is_super_admin,
+            is_foreman=(db_role == "foreman"),
+        ),
     )
 
     # Foreman message with inline buttons
@@ -429,23 +474,44 @@ async def my_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     tg = update.effective_user
     if not tg or not update.message:
         return
+
     user = db.get_user_by_tg(tg.id)
     if not user:
         await update.message.reply_text("⛔ Нет доступа. Напишите /start или нажмите «Старт».")
         return
+
+    # ✅ правильный режим меню (worker/foreman) + супер-админ переключатель остаётся как раньше
+    db_role = user["role"]
+    is_super_admin = tg.id in settings.admin_tg_ids
+    role_to_show = resolve_role_to_show(user, tg.id, context)
+
     bal = db.calc_balance_hours(user["id"])
     status = "долг" if bal < 0 else "доступно"
-    await update.message.reply_text(f"💼 Баланс: {bal} ч ({status})", reply_markup=main_menu(user["role"]))
+
+    await update.message.reply_text(
+        f"💼 Баланс: {bal} ч ({status})",
+        reply_markup=main_menu(
+            role_to_show,
+            is_super_admin=is_super_admin,
+            is_foreman=(db_role == "foreman"),
+        ),
+    )
 
 
 async def my_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg = update.effective_user
     if not tg or not update.message:
         return
+
     user = db.get_user_by_tg(tg.id)
     if not user:
         await update.message.reply_text("⛔ Нет доступа. Напишите /start или нажмите «Старт».")
         return
+
+    # ✅ правильный режим меню (worker/foreman) + супер-админ переключатель
+    db_role = user["role"]
+    is_super_admin = tg.id in settings.admin_tg_ids
+    role_to_show = resolve_role_to_show(user, tg.id, context)
 
     rows = db.execute(
         """
@@ -454,54 +520,94 @@ async def my_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         WHERE target_user_id={p} AND status='pending'
         ORDER BY created_at DESC
         LIMIT 20
-    """,
+        """,
         (user["id"],),
         fetch="all",
     )
 
     if not rows:
-        await update.message.reply_text("⏳ У вас нет заявок в ожидании.", reply_markup=main_menu(user["role"]))
+        await update.message.reply_text(
+            "⏳ У вас нет заявок в ожидании.",
+            reply_markup=main_menu(
+                role_to_show,
+                is_super_admin=is_super_admin,
+                is_foreman=(db_role == "foreman"),
+            ),
+        )
         return
 
     lines = ["⏳ Ваши заявки (ожидают):"]
     for r in rows:
         sign = "➕" if r["op_type"] == "credit" else "➖"
-        lines.append(f"#{r['id']} {sign}{r['hours']}ч • {r['op_date']} • {r['comment'][:40]}")
-    await update.message.reply_text("\n".join(lines), reply_markup=main_menu(user["role"]))
+        comment = (r.get("comment") or "").strip()
+        if len(comment) > 40:
+            comment = comment[:40] + "…"
+        lines.append(f"#{r['id']} {sign}{r['hours']}ч • {r['op_date']} • {comment}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=main_menu(
+            role_to_show,
+            is_super_admin=is_super_admin,
+            is_foreman=(db_role == "foreman"),
+        ),
+    )
 
 
 async def my_statement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg = update.effective_user
     if not tg or not update.message:
         return
+
     user = db.get_user_by_tg(tg.id)
     if not user:
         await update.message.reply_text("⛔ Нет доступа. Напишите /start или нажмите «Старт».")
         return
 
+    # ✅ правильный режим меню (worker/foreman) + супер-админ переключатель
+    db_role = user["role"]
+    is_super_admin = tg.id in settings.admin_tg_ids
+    role_to_show = resolve_role_to_show(user, tg.id, context)
+
     bal = db.calc_balance_hours(user["id"])
     rows = db.list_statement(user["id"], limit=20)
+
     if not rows:
-        await update.message.reply_text("Пока нет операций.", reply_markup=main_menu(user["role"]))
+        await update.message.reply_text(
+            "Пока нет операций.",
+            reply_markup=main_menu(
+                role_to_show,
+                is_super_admin=is_super_admin,
+                is_foreman=(db_role == "foreman"),
+            ),
+        )
         return
 
     header = [
         "📄 Выписка (последние 20)",
         "Дата   Тип  Часы  Статус   Комментарий",
     ]
-    body = []
+
+    body: list[str] = []
     for r in rows:
         sign = "+" if r["op_type"] == "credit" else "-"
         dt = str(r["op_date"])[:10]
-        st = r["status"]
-        c = (r["comment"] or "").replace("\n", " ").strip()
+        st = str(r["status"])
+        c = (r.get("comment") or "").replace("\n", " ").strip()
         if len(c) > 28:
             c = c[:28] + "…"
         body.append(f"{dt[5:]}  {sign}   {r['hours']}   {st:8} {c}")
 
     footer = [f"\nИтоговый баланс: {bal} ч"]
-    await update.message.reply_text("\n".join(header + body + footer), reply_markup=main_menu(user["role"]))
 
+    await update.message.reply_text(
+        "\n".join(header + body + footer),
+        reply_markup=main_menu(
+            role_to_show,
+            is_super_admin=is_super_admin,
+            is_foreman=(db_role == "foreman"),
+        ),
+    )
 
 # ---------- Foreman: pending approvals ----------
 async def foreman_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -778,12 +884,12 @@ async def foreman_adj_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # security: foreman может править только свою команду
     if user["role"] == "foreman":
-        allowed = db.execute(
-            "SELECT 1 FROM users WHERE id={p} AND role='worker' AND team_id={p}",
-            (target_user_id, user.get("team_id")),
+        allowed_user = db.execute(
+            "SELECT team_id FROM users WHERE id={p} AND role='worker'",
+            (target_user_id,),
             fetch="one",
         )
-        if not allowed:
+        if not allowed_user or int(allowed_user.get("team_id") or 0) != int(user.get("team_id") or 0):
             await q.edit_message_text("⛔ Нельзя корректировать сотрудника вне вашей команды.")
             return ConversationHandler.END
 
@@ -874,12 +980,12 @@ async def foreman_adj_comment_finish(update: Update, context: ContextTypes.DEFAU
 
     # security: foreman only own team
     if actor["role"] == "foreman":
-        allowed = db.execute(
-            "SELECT 1 FROM users WHERE id={p} AND role='worker' AND team_id={p}",
-            (target_user_id, actor.get("team_id")),
+        allowed_user = db.execute(
+            "SELECT team_id FROM users WHERE id={p} AND role='worker'",
+            (target_user_id,),
             fetch="one",
         )
-        if not allowed:
+        if not allowed_user or int(allowed_user.get("team_id") or 0) != int(actor.get("team_id") or 0):
             await update.message.reply_text("⛔ Нельзя корректировать сотрудника вне вашей команды.")
             return ConversationHandler.END
 
@@ -1004,12 +1110,12 @@ async def foreman_stmt_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # security: foreman only own team
     if actor["role"] == "foreman":
-        allowed = db.execute(
-            "SELECT 1 FROM users WHERE id={p} AND role='worker' AND team_id={p}",
-            (target_user_id, actor.get("team_id")),
+        allowed_user = db.execute(
+            "SELECT team_id FROM users WHERE id={p} AND role='worker'",
+            (target_user_id,),
             fetch="one",
         )
-        if not allowed:
+        if not allowed_user or int(allowed_user.get("team_id") or 0) != int(actor.get("team_id") or 0):
             await q.edit_message_text("⛔ Нельзя смотреть сотрудника вне вашей команды.")
             return ConversationHandler.END
 
@@ -1039,10 +1145,7 @@ async def foreman_stmt_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             c = c[:28] + "…"
         lines.append(f"{dt[5:]}  {sign}   {r['hours']}   {st:8} {c}")
 
-    text = "\n".join(lines)
-
-    # Важно: edit_message_text ограничен по длине, но 20 строк обычно ок.
-    await q.edit_message_text(text)
+    await q.edit_message_text("\n".join(lines))
     return ConversationHandler.END
 
 # ---------- Director views ----------
@@ -1050,8 +1153,10 @@ async def director_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     tg = update.effective_user
     if not tg or not update.message:
         return
+
     user = db.get_user_by_tg(tg.id)
-    if not user or user["role"] not in ("director", "admin"):
+    is_super_admin = tg.id in settings.admin_tg_ids
+    if not user or (user["role"] not in ("director", "admin") and not is_super_admin):
         await update.message.reply_text("⛔ Недостаточно прав.")
         return
 
@@ -1093,8 +1198,10 @@ async def director_all_balances(update: Update, context: ContextTypes.DEFAULT_TY
     tg = update.effective_user
     if not tg or not update.message:
         return
-    user = db.get_user_by_tg(tg.id)
-    if not user or user["role"] not in ("director", "admin"):
+
+    actor = db.get_user_by_tg(tg.id)
+    is_super_admin = tg.id in settings.admin_tg_ids
+    if not actor or (actor["role"] not in ("director", "admin") and not is_super_admin):
         await update.message.reply_text("⛔ Недостаточно прав.")
         return
 
@@ -1107,7 +1214,8 @@ async def director_all_balances(update: Update, context: ContextTypes.DEFAULT_TY
     for r in rows:
         bal = db.calc_balance_hours(r["id"])
         lines.append(f"• {r['full_name']}: {bal} ч")
-    await update.message.reply_text("\n".join(lines), reply_markup=main_menu(user["role"]))
+
+    await update.message.reply_text("\n".join(lines), reply_markup=main_menu(actor["role"]))
 
 # ---------- Director/Admin: employee card ----------
 async def director_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1116,7 +1224,8 @@ async def director_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     actor = db.get_user_by_tg(tg.id)
-    if not actor or actor["role"] not in ("director", "admin"):
+    is_super_admin = tg.id in settings.admin_tg_ids
+    if not actor or (actor["role"] not in ("director","admin") and not is_super_admin):
         await update.message.reply_text("⛔ Недостаточно прав.")
         return ConversationHandler.END
 
@@ -1151,7 +1260,8 @@ async def director_card_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     actor = db.get_user_by_tg(tg.id)
-    if not actor or actor["role"] not in ("director", "admin"):
+    is_super_admin = tg.id in settings.admin_tg_ids
+    if not actor or (actor["role"] not in ("director","admin") and not is_super_admin):
         await q.edit_message_text("⛔ Недостаточно прав.")
         return ConversationHandler.END
 
@@ -1207,10 +1317,8 @@ async def director_card_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
             c = c[:28] + "…"
         lines.append(f"{dt[5:]}  {sign}   {r['hours']}   {st:8} {c}")
 
-        kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📤 Экспорт CSV", callback_data=f"card_csv:{user_id}")],
-        ]
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📤 Экспорт CSV", callback_data=f"card_csv:{user_id}")]]
     )
     await q.edit_message_text("\n".join(lines), reply_markup=kb)
     return ConversationHandler.END
@@ -1226,7 +1334,8 @@ async def director_card_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     actor = db.get_user_by_tg(tg.id)
-    if not actor or actor["role"] not in ("director", "admin"):
+    is_super_admin = tg.id in settings.admin_tg_ids
+    if not actor or (actor["role"] not in ("director","admin") and not is_super_admin):
         await q.edit_message_text("⛔ Недостаточно прав.")
         return ConversationHandler.END
 
@@ -1602,7 +1711,7 @@ async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if tg.id not in settings.admin_tg_ids:
         await update.message.reply_text("⛔ Недостаточно прав.")
-        return ConversationHandler.END
+        return
 
     users = db.list_users()
     if not users:
@@ -1764,6 +1873,13 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional
 
     # ✅ Если ждём причину отклонения — это приоритет №1 (иначе кнопки начнут «путаться»)
     user = db.get_user_by_tg(tg.id)
+    if not user:
+        await update.message.reply_text(
+            "⛔ Нет доступа. Нажмите /start.\n"
+            f"Ваш Telegram ID: {tg.id}"
+        )
+        return None
+
     op_id_wait = context.user_data.get("await_reject_reason_op_id")
     if op_id_wait and user and user["role"] in ("foreman", "admin"):
         reason = text
@@ -1788,25 +1904,31 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional
             await start(update, context)
             return None
         if text == BTN_WORKER_MODE:
-            # ✅ “Рабочий-режим” для супер-админа = принудительно UI как worker
             context.user_data["ui_role"] = "worker"
             await start(update, context)
-            return None   
+            return None
 
-            if not user:
-                await update.message.reply_text("Напишите /start или нажмите «Старт».")
-                return None
+    # --- Переключение режима для БРИГАДИРА (только role=foreman) ---
+    if user and user.get("role") == "foreman":
+        if text == BTN_FOREMAN_TO_WORKER:
+            db.set_user_view_mode(tg.id, "worker")
+            await start(update, context)
+            return None
 
-    role = user["role"]
+        if text == BTN_FOREMAN_TO_FOREMAN:
+            db.set_user_view_mode(tg.id, "foreman")
+            await start(update, context)
+            return None
 
+    db_role = user["role"]
     is_super_admin = tg.id in settings.admin_tg_ids
-    ui_role = context.user_data.get("ui_role")
-    if ui_role not in ("worker", "foreman", "director", "admin"):
-        ui_role = None
-    role_to_show = ui_role or role
+
+    role_to_show = resolve_role_to_show(user, tg.id, context)
+
+    # защита на всякий: если не супер-админ, то режим admin запрещён
     if role_to_show == "admin" and not is_super_admin:
-        role_to_show = role
-        context.user_data["ui_role"] = role
+        role_to_show = db_role
+        context.user_data["ui_role"] = db_role
 
     # 🏗️ Режим создания команды: админ пишет название сообщением
     if role_to_show == "admin" and context.user_data.get("team_create_mode"):
@@ -1926,7 +2048,7 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         if ui_role not in ("worker", "foreman", "director", "admin"):
             ui_role = None
 
-        role_to_show = ui_role or db_role
+        role_to_show = resolve_role_to_show(user, tg.id, context) if user else db_role
         if role_to_show == "admin" and not is_super_admin:
             role_to_show = db_role
             context.user_data["ui_role"] = db_role
@@ -1947,7 +2069,12 @@ def build_app() -> Application:
     common_fallbacks = [
         CommandHandler("start", start_fallback),
         MessageHandler(filters.Regex(r"^(Отмена|ОТМЕНА|Назад)$"), conv_cancel),
-        MessageHandler(filters.Regex(rf"^({re.escape(BTN_ADMIN_MODE)}|{re.escape(BTN_WORKER_MODE)})$"), mode_switch_fallback),
+        MessageHandler(
+            filters.Regex(
+                rf"^({re.escape(BTN_ADMIN_MODE)}|{re.escape(BTN_WORKER_MODE)}|{re.escape(BTN_FOREMAN_TO_WORKER)}|{re.escape(BTN_FOREMAN_TO_FOREMAN)})$"
+            ),
+            mode_switch_fallback,
+        ),
     ]
 
     op_conv = ConversationHandler(

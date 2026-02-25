@@ -18,3 +18,9 @@ data/
 
 # logs
 *.log
+
+# local backups / dumps
+backups/
+*.dump
+*.sql
+backup_*.sh
