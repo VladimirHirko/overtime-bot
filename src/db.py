@@ -590,3 +590,4 @@ class DB:
         )
         row = self.execute("SELECT * FROM operations ORDER BY id DESC LIMIT 1", fetch="one")
         return row
+
