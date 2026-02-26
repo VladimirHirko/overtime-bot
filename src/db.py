@@ -329,22 +329,26 @@ class DB:
         return self.create_user(tg_id, full_name, role, None)
 
     def set_user_role_team(self, tg_id: int, role: Role, team_id: int | None) -> None:
-        # обновляем пользователя
+        # Берём текущий view_mode (чтобы не уничтожать переключение у foreman)
+        cur = self.execute("SELECT view_mode FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
+        cur_view = (cur.get("view_mode") if cur else None) or "worker"
+
+        if role == "foreman":
+            new_view = cur_view if cur_view in ("worker", "foreman") else "foreman"
+        else:
+            new_view = role  # director/admin/worker — ок
+
         self.execute(
             "UPDATE users SET role={p}, team_id={p}, view_mode={p} WHERE tg_id={p}",
-            (role, team_id, role, tg_id),
+            (role, team_id, new_view, tg_id),
         )
 
-        # ✅ Авто-привязка бригадира к команде:
-        # когда пользователь становится foreman и у него есть team_id,
-        # записываем teams.foreman_user_id = users.id
+        # авто-привязка/отвязка foreman — оставляем твою логику как есть
         if role == "foreman" and team_id is not None:
             u = self.execute("SELECT id FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
             if u:
                 self.set_team_foreman(int(team_id), int(u["id"]))
 
-        # ✅ Если с пользователя сняли роль foreman ИЛИ убрали team_id —
-        # отвяжем его от команды (только если он был назначен foreman в teams)
         if role != "foreman" or team_id is None:
             u = self.execute("SELECT id FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
             if u:
@@ -525,26 +529,23 @@ class DB:
             """, fetch="all")
 
     def list_workers_for_foreman(self, foreman_user_id: int) -> list[dict]:
-        """
-        Returns active workers in foreman's team.
-        """
-        foreman = self.execute(
-            "SELECT team_id FROM users WHERE id={p}",
-            (foreman_user_id,),
-            fetch="one",
-        )
+        foreman = self.execute("SELECT team_id FROM users WHERE id={p}", (foreman_user_id,), fetch="one")
         if not foreman or not foreman.get("team_id"):
             return []
         team_id = foreman["team_id"]
 
         if self.driver == "postgres":
             return self.execute(
-                "SELECT id, tg_id, full_name FROM users WHERE role='worker' AND team_id={p} AND active=TRUE ORDER BY full_name",
+                "SELECT id, tg_id, full_name FROM users "
+                "WHERE role IN ('worker','foreman') AND team_id={p} AND active=TRUE "
+                "ORDER BY full_name",
                 (team_id,),
                 fetch="all",
             )
         return self.execute(
-            "SELECT id, tg_id, full_name FROM users WHERE role='worker' AND team_id={p} AND active=1 ORDER BY full_name",
+            "SELECT id, tg_id, full_name FROM users "
+            "WHERE role IN ('worker','foreman') AND team_id={p} AND active=1 "
+            "ORDER BY full_name",
             (team_id,),
             fetch="all",
         )
