@@ -18,6 +18,7 @@ class DB:
     DB wrapper that supports:
       - PostgreSQL (via DATABASE_URL)  ✅ for Railway
       - SQLite fallback (local)        ✅ for quick local tests
+
     Query placeholder style:
       Use "{p}" in SQL, it will be replaced by "%s" (Postgres) or "?" (SQLite).
     """
@@ -27,18 +28,20 @@ class DB:
 
     def __init__(self, database_url: Optional[str]) -> None:
         self.database_url = database_url
-        self.driver = "postgres" if (database_url and database_url.startswith("postgres")) else "sqlite"
+        self.driver = (
+            "postgres"
+            if (database_url and database_url.startswith("postgres"))
+            else "sqlite"
+        )
 
         if self.driver == "postgres":
-            self.conn = psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
-            self.conn.autocommit = True
+            self.conn = self._connect_postgres()
         else:
             os.makedirs("data", exist_ok=True)
             path = os.path.join("data", "overtime.db")
             self.conn = sqlite3.connect(path)
             self.conn.row_factory = sqlite3.Row
 
-            # ✅ SQLite: включаем FK (иначе каскады/целостность не работают)
             try:
                 self.conn.execute("PRAGMA foreign_keys = ON;")
             except Exception:
@@ -46,16 +49,57 @@ class DB:
 
         self.ensure_schema()
 
+    def _connect_postgres(self):
+        """
+        Creates a new PostgreSQL connection.
+
+        Used:
+        - when DB starts
+        - when Railway/Postgres restarts
+        - when the old connection becomes unusable
+        """
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL не задан")
+
+        return psycopg.connect(
+            self.database_url,
+            autocommit=True,
+            row_factory=dict_row,
+            connect_timeout=10,
+        )
+
+    def _reconnect_postgres(self) -> None:
+        """
+        Closes the old PostgreSQL connection and creates a new one.
+        """
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+        self.conn = self._connect_postgres()
+
     def mark_welcome_seen(self, tg_id: int) -> None:
         if self.driver == "postgres":
-            self.execute("UPDATE users SET seen_welcome=TRUE WHERE tg_id={p}", (tg_id,))
+            self.execute(
+                "UPDATE users SET seen_welcome=TRUE WHERE tg_id={p}",
+                (tg_id,),
+            )
         else:
-            self.execute("UPDATE users SET seen_welcome=1 WHERE tg_id={p}", (tg_id,))
+            self.execute(
+                "UPDATE users SET seen_welcome=1 WHERE tg_id={p}",
+                (tg_id,),
+            )
 
     def has_seen_welcome(self, tg_id: int) -> bool:
-        row = self.execute("SELECT seen_welcome FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
+        row = self.execute(
+            "SELECT seen_welcome FROM users WHERE tg_id={p}",
+            (tg_id,),
+            fetch="one",
+        )
         if not row:
             return False
+
         v = row.get("seen_welcome")
         return bool(v)
 
@@ -69,31 +113,64 @@ class DB:
         return "%s" if self.driver == "postgres" else "?"
 
     def _fmt(self, sql: str) -> str:
-        # replace each "{p}" with proper placeholder
         ph = self._ph()
         return sql.replace("{p}", ph)
 
-    def execute(self, sql: str, params: tuple[Any, ...] = (), *, fetch: str | None = None) -> Any:
+    def execute(
+        self,
+        sql: str,
+        params: tuple[Any, ...] = (),
+        *,
+        fetch: str | None = None,
+    ) -> Any:
         sql = self._fmt(sql)
+
+        # ---------- PostgreSQL ----------
         if self.driver == "postgres":
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params)
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
-                return None
-        else:
-            cur = self.conn.cursor()
-            cur.execute(sql, params)
-            self.conn.commit()
-            if fetch == "one":
-                row = cur.fetchone()
-                return dict(row) if row else None
-            if fetch == "all":
-                rows = cur.fetchall()
-                return [dict(r) for r in rows]
-            return None
+            for attempt in range(2):
+                try:
+                    # psycopg already knows the connection is closed
+                    if self.conn.closed:
+                        self._reconnect_postgres()
+
+                    with self.conn.cursor() as cur:
+                        cur.execute(sql, params)
+
+                        if fetch == "one":
+                            return cur.fetchone()
+
+                        if fetch == "all":
+                            return cur.fetchall()
+
+                        return None
+
+                except (
+                    psycopg.OperationalError,
+                    psycopg.InterfaceError,
+                ):
+                    # First failure:
+                    # reconnect and retry the same SQL query once.
+                    if attempt == 0:
+                        self._reconnect_postgres()
+                        continue
+
+                    # Reconnect also failed: propagate real error.
+                    raise
+
+        # ---------- SQLite ----------
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        self.conn.commit()
+
+        if fetch == "one":
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+        if fetch == "all":
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+        return None
 
     # ---------- Schema ----------
 
@@ -130,11 +207,11 @@ class DB:
             id SERIAL PRIMARY KEY,
             target_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             created_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            op_type TEXT NOT NULL,                 -- "credit" | "debit"
+            op_type TEXT NOT NULL,
             op_date DATE NOT NULL,
-            hours NUMERIC(10,2) NOT NULL,          -- positive number
+            hours NUMERIC(10,2) NOT NULL,
             comment TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL,                  -- "pending" | "approved" | "rejected" | "cancelled"
+            status TEXT NOT NULL,
             decided_by_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
             decision_comment TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -154,17 +231,33 @@ class DB:
         );
         """)
 
-        self.execute("CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id);")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_ops_target ON operations(target_user_id);")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);")
-        # --- lightweight migrations ---
-        self.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_welcome BOOLEAN NOT NULL DEFAULT FALSE;")
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id);"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_target ON operations(target_user_id);"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);"
+        )
 
-        # --- view_mode (foreman/admin can switch to worker UI) ---
-        self.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS view_mode TEXT;")
-        self.execute("UPDATE users SET view_mode = role WHERE view_mode IS NULL;")
-        self.execute("ALTER TABLE users ALTER COLUMN view_mode SET DEFAULT 'worker';")
+        # --- lightweight migrations ---
+        self.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_welcome BOOLEAN NOT NULL DEFAULT FALSE;"
+        )
+
+        self.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS view_mode TEXT;"
+        )
+        self.execute(
+            "UPDATE users SET view_mode = role WHERE view_mode IS NULL;"
+        )
+        self.execute(
+            "ALTER TABLE users ALTER COLUMN view_mode SET DEFAULT 'worker';"
+        )
 
     def _ensure_schema_sqlite(self) -> None:
         self.execute("""
@@ -217,30 +310,44 @@ class DB:
         );
         """)
 
-        self.execute("CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id);")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_ops_target ON operations(target_user_id);")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);")
-        # --- lightweight migrations ---
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id);"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_target ON operations(target_user_id);"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);"
+        )
+
         # seen_welcome
         try:
-            self.execute("ALTER TABLE users ADD COLUMN seen_welcome INTEGER NOT NULL DEFAULT 0;")
+            self.execute(
+                "ALTER TABLE users ADD COLUMN seen_welcome INTEGER NOT NULL DEFAULT 0;"
+            )
         except Exception:
             pass
 
         # view_mode
         try:
-            self.execute("ALTER TABLE users ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'worker';")
+            self.execute(
+                "ALTER TABLE users ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'worker';"
+            )
         except Exception:
             pass
 
-        # normalize old rows
         try:
-            self.execute("UPDATE users SET view_mode = role WHERE view_mode IS NULL OR view_mode='';")
+            self.execute(
+                "UPDATE users SET view_mode = role WHERE view_mode IS NULL OR view_mode='';"
+            )
         except Exception:
             pass
 
     # ---------- RESET / WIPE ----------
+
     def reset_all_data(self) -> None:
         """
         Deletes ALL rows from all business tables, but keeps schema intact.
@@ -255,8 +362,6 @@ class DB:
         """
         Postgres: TRUNCATE + RESTART IDENTITY + CASCADE
         """
-        # Важно: TRUNCATE не принимает плейсхолдеры, поэтому обычной строкой.
-        # Порядок не критичен из-за CASCADE, но держим логичный.
         self.execute("""
             TRUNCATE TABLE
                 audit_log,
@@ -270,7 +375,6 @@ class DB:
         """
         SQLite: DELETE FROM tables + reset autoincrement counters.
         """
-        # В SQLite лучше отключить FK на время, иначе можно словить ограничения
         try:
             self.conn.execute("PRAGMA foreign_keys = OFF;")
         except Exception:
@@ -278,15 +382,12 @@ class DB:
 
         cur = self.conn.cursor()
 
-        # Порядок: сначала дочерние, потом родительские
         for t in ("audit_log", "operations", "users", "teams"):
             cur.execute(f"DELETE FROM {t};")
 
-        # Сброс автоинкремента (если есть AUTOINCREMENT)
         try:
             cur.execute("DELETE FROM sqlite_sequence;")
         except Exception:
-            # sqlite_sequence может отсутствовать, если AUTOINCREMENT не использовался
             pass
 
         self.conn.commit()
@@ -300,100 +401,228 @@ class DB:
 
     def get_user_by_tg(self, tg_id: int) -> dict | None:
         return self.execute(
-            "SELECT * FROM users WHERE tg_id={p} AND active=TRUE" if self.driver == "postgres"
-            else "SELECT * FROM users WHERE tg_id={p} AND active=1",
+            (
+                "SELECT * FROM users WHERE tg_id={p} AND active=TRUE"
+                if self.driver == "postgres"
+                else "SELECT * FROM users WHERE tg_id={p} AND active=1"
+            ),
             (tg_id,),
             fetch="one",
         )
 
-    def create_user(self, tg_id: int, full_name: str, role: Role, team_id: int | None = None) -> dict:
+    def create_user(
+        self,
+        tg_id: int,
+        full_name: str,
+        role: Role,
+        team_id: int | None = None,
+    ) -> dict:
         if self.driver == "postgres":
             row = self.execute(
-                "INSERT INTO users (tg_id, full_name, role, view_mode, team_id) VALUES ({p},{p},{p},{p},{p}) RETURNING *",
+                """
+                INSERT INTO users
+                (tg_id, full_name, role, view_mode, team_id)
+                VALUES ({p},{p},{p},{p},{p})
+                RETURNING *
+                """,
                 (tg_id, full_name, role, role, team_id),
                 fetch="one",
             )
             return row
-        else:
-            self.execute(
-                "INSERT INTO users (tg_id, full_name, role, view_mode, team_id) VALUES ({p},{p},{p},{p},{p})",
-                (tg_id, full_name, role, role, team_id),
-            )
-            return self.get_user_by_tg(tg_id)  # type: ignore
 
-    def upsert_user_minimal_admin(self, tg_id: int, full_name: str, role: Role = "admin") -> dict:
-        # ensure admin exists
+        self.execute(
+            """
+            INSERT INTO users
+            (tg_id, full_name, role, view_mode, team_id)
+            VALUES ({p},{p},{p},{p},{p})
+            """,
+            (tg_id, full_name, role, role, team_id),
+        )
+        return self.get_user_by_tg(tg_id)  # type: ignore
+
+    def upsert_user_minimal_admin(
+        self,
+        tg_id: int,
+        full_name: str,
+        role: Role = "admin",
+    ) -> dict:
         user = self.get_user_by_tg(tg_id)
         if user:
             return user
-        return self.create_user(tg_id, full_name, role, None)
 
-    def set_user_role_team(self, tg_id: int, role: Role, team_id: int | None) -> None:
-        # Берём текущий view_mode (чтобы не уничтожать переключение у foreman)
-        cur = self.execute("SELECT view_mode FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
-        cur_view = (cur.get("view_mode") if cur else None) or "worker"
+        return self.create_user(
+            tg_id,
+            full_name,
+            role,
+            None,
+        )
+
+    def set_user_role_team(
+        self,
+        tg_id: int,
+        role: Role,
+        team_id: int | None,
+    ) -> None:
+        cur = self.execute(
+            "SELECT view_mode FROM users WHERE tg_id={p}",
+            (tg_id,),
+            fetch="one",
+        )
+
+        cur_view = (
+            cur.get("view_mode")
+            if cur
+            else None
+        ) or "worker"
 
         if role == "foreman":
-            new_view = cur_view if cur_view in ("worker", "foreman") else "foreman"
+            new_view = (
+                cur_view
+                if cur_view in ("worker", "foreman")
+                else "foreman"
+            )
         else:
-            new_view = role  # director/admin/worker — ок
+            new_view = role
 
         self.execute(
-            "UPDATE users SET role={p}, team_id={p}, view_mode={p} WHERE tg_id={p}",
+            """
+            UPDATE users
+            SET role={p}, team_id={p}, view_mode={p}
+            WHERE tg_id={p}
+            """,
             (role, team_id, new_view, tg_id),
         )
 
-        # авто-привязка/отвязка foreman — оставляем твою логику как есть
         if role == "foreman" and team_id is not None:
-            u = self.execute("SELECT id FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
+            u = self.execute(
+                "SELECT id FROM users WHERE tg_id={p}",
+                (tg_id,),
+                fetch="one",
+            )
+
             if u:
-                self.set_team_foreman(int(team_id), int(u["id"]))
+                self.set_team_foreman(
+                    int(team_id),
+                    int(u["id"]),
+                )
 
         if role != "foreman" or team_id is None:
-            u = self.execute("SELECT id FROM users WHERE tg_id={p}", (tg_id,), fetch="one")
+            u = self.execute(
+                "SELECT id FROM users WHERE tg_id={p}",
+                (tg_id,),
+                fetch="one",
+            )
+
             if u:
                 self.execute(
-                    "UPDATE teams SET foreman_user_id=NULL WHERE foreman_user_id={p}",
+                    """
+                    UPDATE teams
+                    SET foreman_user_id=NULL
+                    WHERE foreman_user_id={p}
+                    """,
                     (int(u["id"]),),
                 )
 
     def list_users(self) -> list[dict]:
-        return self.execute("SELECT id,tg_id,full_name,role,team_id FROM users ORDER BY role, full_name", fetch="all")
+        return self.execute(
+            """
+            SELECT id,tg_id,full_name,role,team_id
+            FROM users
+            ORDER BY role, full_name
+            """,
+            fetch="all",
+        )
 
     def create_team(self, name: str) -> dict:
         if self.driver == "postgres":
             return self.execute(
-                "INSERT INTO teams (name) VALUES ({p}) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING *",
+                """
+                INSERT INTO teams (name)
+                VALUES ({p})
+                ON CONFLICT (name)
+                DO UPDATE SET name=EXCLUDED.name
+                RETURNING *
+                """,
                 (name,),
                 fetch="one",
             )
-        else:
-            # sqlite: INSERT OR IGNORE then select
-            self.execute("INSERT OR IGNORE INTO teams (name) VALUES ({p})", (name,))
-            return self.execute("SELECT * FROM teams WHERE name={p}", (name,), fetch="one")
+
+        self.execute(
+            "INSERT OR IGNORE INTO teams (name) VALUES ({p})",
+            (name,),
+        )
+
+        return self.execute(
+            "SELECT * FROM teams WHERE name={p}",
+            (name,),
+            fetch="one",
+        )
 
     def list_teams(self) -> list[dict]:
-        return self.execute("SELECT * FROM teams ORDER BY name", fetch="all")
+        return self.execute(
+            "SELECT * FROM teams ORDER BY name",
+            fetch="all",
+        )
 
-    def set_team_foreman(self, team_id: int, foreman_user_id: int) -> None:
-        self.execute("UPDATE teams SET foreman_user_id={p} WHERE id={p}", (foreman_user_id, team_id))
+    def set_team_foreman(
+        self,
+        team_id: int,
+        foreman_user_id: int,
+    ) -> None:
+        self.execute(
+            """
+            UPDATE teams
+            SET foreman_user_id={p}
+            WHERE id={p}
+            """,
+            (foreman_user_id, team_id),
+        )
 
-    def get_team_foreman_tg(self, team_id: int) -> int | None:
-        row = self.execute("""
+    def get_team_foreman_tg(
+        self,
+        team_id: int,
+    ) -> int | None:
+        row = self.execute(
+            """
             SELECT u.tg_id AS tg_id
             FROM teams t
             JOIN users u ON u.id = t.foreman_user_id
             WHERE t.id={p}
-        """, (team_id,), fetch="one")
+            """,
+            (team_id,),
+            fetch="one",
+        )
+
         return int(row["tg_id"]) if row else None
 
     def list_director_tg_ids(self) -> list[int]:
-        rows = self.execute("SELECT tg_id FROM users WHERE role='director' AND active=TRUE" if self.driver == "postgres"
-                            else "SELECT tg_id FROM users WHERE role='director' AND active=1", fetch="all")
-        return [int(r["tg_id"]) for r in rows]
+        rows = self.execute(
+            (
+                "SELECT tg_id FROM users WHERE role='director' AND active=TRUE"
+                if self.driver == "postgres"
+                else "SELECT tg_id FROM users WHERE role='director' AND active=1"
+            ),
+            fetch="all",
+        )
 
-    def set_user_view_mode(self, tg_id: int, view_mode: str) -> None:
-        self.execute("UPDATE users SET view_mode={p} WHERE tg_id={p}", (view_mode, tg_id))
+        return [
+            int(r["tg_id"])
+            for r in rows
+        ]
+
+    def set_user_view_mode(
+        self,
+        tg_id: int,
+        view_mode: str,
+    ) -> None:
+        self.execute(
+            """
+            UPDATE users
+            SET view_mode={p}
+            WHERE tg_id={p}
+            """,
+            (view_mode, tg_id),
+        )
 
     # ---------- Operations / Balance ----------
 
@@ -401,151 +630,358 @@ class DB:
         self,
         target_user_id: int,
         created_by_user_id: int,
-        op_type: str,  # credit/debit
-        op_date: str,  # YYYY-MM-DD
+        op_type: str,
+        op_date: str,
         hours: float,
         comment: str,
         status: str = "pending",
     ) -> dict:
         if self.driver == "postgres":
             return self.execute(
-                """INSERT INTO operations
-                   (target_user_id, created_by_user_id, op_type, op_date, hours, comment, status)
-                   VALUES ({p},{p},{p},{p},{p},{p},{p})
-                   RETURNING *""",
-                (target_user_id, created_by_user_id, op_type, op_date, hours, comment, status),
+                """
+                INSERT INTO operations
+                (
+                    target_user_id,
+                    created_by_user_id,
+                    op_type,
+                    op_date,
+                    hours,
+                    comment,
+                    status
+                )
+                VALUES
+                ({p},{p},{p},{p},{p},{p},{p})
+                RETURNING *
+                """,
+                (
+                    target_user_id,
+                    created_by_user_id,
+                    op_type,
+                    op_date,
+                    hours,
+                    comment,
+                    status,
+                ),
                 fetch="one",
             )
-        else:
-            self.execute(
-                """INSERT INTO operations
-                   (target_user_id, created_by_user_id, op_type, op_date, hours, comment, status)
-                   VALUES ({p},{p},{p},{p},{p},{p},{p})""",
-                (target_user_id, created_by_user_id, op_type, op_date, hours, comment, status),
+
+        self.execute(
+            """
+            INSERT INTO operations
+            (
+                target_user_id,
+                created_by_user_id,
+                op_type,
+                op_date,
+                hours,
+                comment,
+                status
             )
-            row = self.execute("SELECT * FROM operations ORDER BY id DESC LIMIT 1", fetch="one")
-            return row
+            VALUES
+            ({p},{p},{p},{p},{p},{p},{p})
+            """,
+            (
+                target_user_id,
+                created_by_user_id,
+                op_type,
+                op_date,
+                hours,
+                comment,
+                status,
+            ),
+        )
 
-    def get_operation(self, op_id: int) -> dict | None:
-        return self.execute("SELECT * FROM operations WHERE id={p}", (op_id,), fetch="one")
+        return self.execute(
+            "SELECT * FROM operations ORDER BY id DESC LIMIT 1",
+            fetch="one",
+        )
 
-    def list_pending_for_foreman(self, foreman_user_id: int) -> list[dict]:
-        # pending operations for users in foreman's team
-        foreman = self.execute("SELECT team_id FROM users WHERE id={p}", (foreman_user_id,), fetch="one")
+    def get_operation(
+        self,
+        op_id: int,
+    ) -> dict | None:
+        return self.execute(
+            "SELECT * FROM operations WHERE id={p}",
+            (op_id,),
+            fetch="one",
+        )
+
+    def list_pending_for_foreman(
+        self,
+        foreman_user_id: int,
+    ) -> list[dict]:
+        foreman = self.execute(
+            "SELECT team_id FROM users WHERE id={p}",
+            (foreman_user_id,),
+            fetch="one",
+        )
+
         if not foreman or not foreman.get("team_id"):
             return []
+
         team_id = foreman["team_id"]
-        return self.execute("""
+
+        return self.execute(
+            """
             SELECT o.*, u.full_name AS target_name
             FROM operations o
             JOIN users u ON u.id = o.target_user_id
-            WHERE o.status='pending' AND u.team_id={p}
+            WHERE o.status='pending'
+            AND u.team_id={p}
             ORDER BY o.created_at ASC
-        """, (team_id,), fetch="all")
-
-    def approve_operation(self, op_id: int, foreman_user_id: int) -> None:
-        if self.driver == "postgres":
-            self.execute("""
-                UPDATE operations
-                SET status='approved', decided_by_user_id={p}, decided_at=NOW(), decision_comment=''
-                WHERE id={p} AND status='pending'
-            """, (foreman_user_id, op_id))
-        else:
-            self.execute("""
-                UPDATE operations
-                SET status='approved', decided_by_user_id={p}, decided_at=datetime('now'), decision_comment=''
-                WHERE id={p} AND status='pending'
-            """, (foreman_user_id, op_id))
-
-    def reject_operation(self, op_id: int, foreman_user_id: int, reason: str) -> None:
-        if self.driver == "postgres":
-            self.execute("""
-                UPDATE operations
-                SET status='rejected', decided_by_user_id={p}, decided_at=NOW(), decision_comment={p}
-                WHERE id={p} AND status='pending'
-            """, (foreman_user_id, reason, op_id))
-        else:
-            self.execute("""
-                UPDATE operations
-                SET status='rejected', decided_by_user_id={p}, decided_at=datetime('now'), decision_comment={p}
-                WHERE id={p} AND status='pending'
-            """, (foreman_user_id, reason, op_id))
-
-    def calc_balance_hours(self, user_id: int) -> float:
-        row = self.execute("""
-            SELECT
-              COALESCE(SUM(CASE WHEN status='approved' AND op_type='credit' THEN hours ELSE 0 END),0) AS plus_h,
-              COALESCE(SUM(CASE WHEN status='approved' AND op_type='debit'  THEN hours ELSE 0 END),0) AS minus_h
-            FROM operations
-            WHERE target_user_id={p}
-        """, (user_id,), fetch="one")
-        plus_h = float(row["plus_h"]) if row else 0.0
-        minus_h = float(row["minus_h"]) if row else 0.0
-        return round(plus_h - minus_h, 2)
-
-    def list_statement(self, user_id: int, limit: int = 20) -> list[dict]:
-        if self.driver == "postgres":
-            return self.execute("""
-                SELECT o.*, u.full_name AS decided_by_name
-                FROM operations o
-                LEFT JOIN users u ON u.id = o.decided_by_user_id
-                WHERE o.target_user_id={p}
-                ORDER BY o.created_at DESC
-                LIMIT {limit}
-            """.replace("{limit}", str(limit)), (user_id,), fetch="all")
-        else:
-            return self.execute("""
-                SELECT o.*, u.full_name AS decided_by_name
-                FROM operations o
-                LEFT JOIN users u ON u.id = o.decided_by_user_id
-                WHERE o.target_user_id={p}
-                ORDER BY o.created_at DESC
-                LIMIT {limit}
-            """.replace("{limit}", str(limit)), (user_id,), fetch="all")
-
-    def log_event(self, actor_user_id: int | None, event: str, entity: str, entity_id: int | None, meta: dict) -> None:
-        meta_json = json.dumps(meta, ensure_ascii=False)
-        self.execute(
-            "INSERT INTO audit_log (actor_user_id, event, entity, entity_id, meta_json) VALUES ({p},{p},{p},{p},{p})",
-            (actor_user_id, event, entity, entity_id, meta_json),
+            """,
+            (team_id,),
+            fetch="all",
         )
 
-    def list_audit(self, limit: int = 30) -> list[dict]:
+    def approve_operation(
+        self,
+        op_id: int,
+        foreman_user_id: int,
+    ) -> None:
         if self.driver == "postgres":
-            return self.execute(f"""
-                SELECT a.*, u.full_name AS actor_name
-                FROM audit_log a
-                LEFT JOIN users u ON u.id=a.actor_user_id
-                ORDER BY a.created_at DESC
-                LIMIT {limit}
-            """, fetch="all")
+            self.execute(
+                """
+                UPDATE operations
+                SET
+                    status='approved',
+                    decided_by_user_id={p},
+                    decided_at=NOW(),
+                    decision_comment=''
+                WHERE id={p}
+                AND status='pending'
+                """,
+                (foreman_user_id, op_id),
+            )
         else:
-            return self.execute(f"""
-                SELECT a.*, u.full_name AS actor_name
-                FROM audit_log a
-                LEFT JOIN users u ON u.id=a.actor_user_id
-                ORDER BY a.created_at DESC
-                LIMIT {limit}
-            """, fetch="all")
+            self.execute(
+                """
+                UPDATE operations
+                SET
+                    status='approved',
+                    decided_by_user_id={p},
+                    decided_at=datetime('now'),
+                    decision_comment=''
+                WHERE id={p}
+                AND status='pending'
+                """,
+                (foreman_user_id, op_id),
+            )
 
-    def list_workers_for_foreman(self, foreman_user_id: int) -> list[dict]:
-        foreman = self.execute("SELECT team_id FROM users WHERE id={p}", (foreman_user_id,), fetch="one")
+    def reject_operation(
+        self,
+        op_id: int,
+        foreman_user_id: int,
+        reason: str,
+    ) -> None:
+        if self.driver == "postgres":
+            self.execute(
+                """
+                UPDATE operations
+                SET
+                    status='rejected',
+                    decided_by_user_id={p},
+                    decided_at=NOW(),
+                    decision_comment={p}
+                WHERE id={p}
+                AND status='pending'
+                """,
+                (foreman_user_id, reason, op_id),
+            )
+        else:
+            self.execute(
+                """
+                UPDATE operations
+                SET
+                    status='rejected',
+                    decided_by_user_id={p},
+                    decided_at=datetime('now'),
+                    decision_comment={p}
+                WHERE id={p}
+                AND status='pending'
+                """,
+                (foreman_user_id, reason, op_id),
+            )
+
+    def calc_balance_hours(
+        self,
+        user_id: int,
+    ) -> float:
+        row = self.execute(
+            """
+            SELECT
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status='approved'
+                            AND op_type='credit'
+                            THEN hours
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS plus_h,
+
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status='approved'
+                            AND op_type='debit'
+                            THEN hours
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS minus_h
+
+            FROM operations
+            WHERE target_user_id={p}
+            """,
+            (user_id,),
+            fetch="one",
+        )
+
+        plus_h = (
+            float(row["plus_h"])
+            if row
+            else 0.0
+        )
+
+        minus_h = (
+            float(row["minus_h"])
+            if row
+            else 0.0
+        )
+
+        return round(
+            plus_h - minus_h,
+            2,
+        )
+
+    def list_statement(
+        self,
+        user_id: int,
+        limit: int = 20,
+    ) -> list[dict]:
+        return self.execute(
+            """
+            SELECT
+                o.*,
+                u.full_name AS decided_by_name
+
+            FROM operations o
+
+            LEFT JOIN users u
+                ON u.id = o.decided_by_user_id
+
+            WHERE o.target_user_id={p}
+
+            ORDER BY o.created_at DESC
+
+            LIMIT {limit}
+            """.replace(
+                "{limit}",
+                str(limit),
+            ),
+            (user_id,),
+            fetch="all",
+        )
+
+    def log_event(
+        self,
+        actor_user_id: int | None,
+        event: str,
+        entity: str,
+        entity_id: int | None,
+        meta: dict,
+    ) -> None:
+        meta_json = json.dumps(
+            meta,
+            ensure_ascii=False,
+        )
+
+        self.execute(
+            """
+            INSERT INTO audit_log
+            (
+                actor_user_id,
+                event,
+                entity,
+                entity_id,
+                meta_json
+            )
+            VALUES
+            ({p},{p},{p},{p},{p})
+            """,
+            (
+                actor_user_id,
+                event,
+                entity,
+                entity_id,
+                meta_json,
+            ),
+        )
+
+    def list_audit(
+        self,
+        limit: int = 30,
+    ) -> list[dict]:
+        return self.execute(
+            f"""
+            SELECT
+                a.*,
+                u.full_name AS actor_name
+
+            FROM audit_log a
+
+            LEFT JOIN users u
+                ON u.id=a.actor_user_id
+
+            ORDER BY a.created_at DESC
+
+            LIMIT {limit}
+            """,
+            fetch="all",
+        )
+
+    def list_workers_for_foreman(
+        self,
+        foreman_user_id: int,
+    ) -> list[dict]:
+        foreman = self.execute(
+            "SELECT team_id FROM users WHERE id={p}",
+            (foreman_user_id,),
+            fetch="one",
+        )
+
         if not foreman or not foreman.get("team_id"):
             return []
+
         team_id = foreman["team_id"]
 
         if self.driver == "postgres":
             return self.execute(
-                "SELECT id, tg_id, full_name FROM users "
-                "WHERE role IN ('worker','foreman') AND team_id={p} AND active=TRUE "
-                "ORDER BY full_name",
+                """
+                SELECT id, tg_id, full_name
+                FROM users
+                WHERE role IN ('worker','foreman')
+                AND team_id={p}
+                AND active=TRUE
+                ORDER BY full_name
+                """,
                 (team_id,),
                 fetch="all",
             )
+
         return self.execute(
-            "SELECT id, tg_id, full_name FROM users "
-            "WHERE role IN ('worker','foreman') AND team_id={p} AND active=1 "
-            "ORDER BY full_name",
+            """
+            SELECT id, tg_id, full_name
+            FROM users
+            WHERE role IN ('worker','foreman')
+            AND team_id={p}
+            AND active=1
+            ORDER BY full_name
+            """,
             (team_id,),
             fetch="all",
         )
@@ -554,41 +990,91 @@ class DB:
         self,
         target_user_id: int,
         created_by_user_id: int,
-        op_type: str,   # "credit" | "debit"
-        op_date: str,   # YYYY-MM-DD
+        op_type: str,
+        op_date: str,
         hours: float,
         comment: str,
     ) -> dict:
         """
-        Foreman/admin manual adjustment: creates operation immediately approved,
+        Foreman/admin manual adjustment:
+        creates operation immediately approved
         and sets decided_by_user_id + decided_at.
         """
+
         if self.driver == "postgres":
             return self.execute(
                 """
                 INSERT INTO operations
-                  (target_user_id, created_by_user_id, op_type, op_date, hours, comment, status,
-                   decided_by_user_id, decided_at, decision_comment)
+                (
+                    target_user_id,
+                    created_by_user_id,
+                    op_type,
+                    op_date,
+                    hours,
+                    comment,
+                    status,
+                    decided_by_user_id,
+                    decided_at,
+                    decision_comment
+                )
                 VALUES
-                  ({p},{p},{p},{p},{p},{p},'approved',
-                   {p}, NOW(), '')
+                (
+                    {p},{p},{p},{p},{p},{p},
+                    'approved',
+                    {p},
+                    NOW(),
+                    ''
+                )
                 RETURNING *
                 """,
-                (target_user_id, created_by_user_id, op_type, op_date, hours, comment, created_by_user_id),
+                (
+                    target_user_id,
+                    created_by_user_id,
+                    op_type,
+                    op_date,
+                    hours,
+                    comment,
+                    created_by_user_id,
+                ),
                 fetch="one",
             )
 
         self.execute(
             """
             INSERT INTO operations
-              (target_user_id, created_by_user_id, op_type, op_date, hours, comment, status,
-               decided_by_user_id, decided_at, decision_comment)
+            (
+                target_user_id,
+                created_by_user_id,
+                op_type,
+                op_date,
+                hours,
+                comment,
+                status,
+                decided_by_user_id,
+                decided_at,
+                decision_comment
+            )
             VALUES
-              ({p},{p},{p},{p},{p},{p},'approved',
-               {p}, datetime('now'), '')
+            (
+                {p},{p},{p},{p},{p},{p},
+                'approved',
+                {p},
+                datetime('now'),
+                ''
+            )
             """,
-            (target_user_id, created_by_user_id, op_type, op_date, hours, comment, created_by_user_id),
+            (
+                target_user_id,
+                created_by_user_id,
+                op_type,
+                op_date,
+                hours,
+                comment,
+                created_by_user_id,
+            ),
         )
-        row = self.execute("SELECT * FROM operations ORDER BY id DESC LIMIT 1", fetch="one")
-        return row
 
+        return self.execute(
+            "SELECT * FROM operations ORDER BY id DESC LIMIT 1",
+            fetch="one",
+        )
